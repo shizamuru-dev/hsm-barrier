@@ -1,0 +1,81 @@
+# ==========================================
+# C++ & CMake Build Artifacts
+# ==========================================
+[Bb]uild/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+CMakeScripts/
+Testing/
+Makefile
+*.cmake
+!CMakeLists.txt
+!cmake/*.cmake
+
+# Скомпилированные бинарники и библиотеки
+bin/
+lib/
+*.o
+*.a
+*.so
+*.so.*
+*.out
+barrier
+inspector
+
+# ==========================================
+# Embedded & ML Models (тяжелые веса)
+# ==========================================
+*.om
+*.onnx
+*.weights
+*.pt
+*.engine
+*.ckpt
+!models/.gitkeep
+
+# ==========================================
+# ML Training, Datasets & Python Env
+# ==========================================
+.venv/
+env/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+scripts/ML/results/
+scripts/ML/exported_models/
+scripts/ML/.cache/
+scripts/ML/dataset/
+lightning_logs/
+
+# Тестовые медиадампы с камер
+*.mp4
+*.avi
+*.mkv
+*.jpg
+*.png
+!docs/**/*.png
+!docs/**/*.jpg
+
+# ==========================================
+# Локальные моки для автокомплита CLion
+# ==========================================
+dev/
+deps/
+
+# ==========================================
+# IDE & Редакторы
+# ==========================================
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# ==========================================
+# Логи и дампы рантайма
+# ==========================================
+*.log
+core
+gmon.out
