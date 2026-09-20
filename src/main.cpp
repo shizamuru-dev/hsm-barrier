@@ -11,18 +11,23 @@
 #include "../include/hardware/i2c_bus.h"
 #include "../include/hardware/pca9685.h"
 #include "../include/hardware/servo.h"
+#include "../include/hardware/vl53l0x.h"
 #include "../include/hardware/camera_stream.h"
 #include "../include/npu/npu_model.h"
 #include "../include/npu/yolo_postprocess.h"
 #include "../include/npu/patchcore_engine.h"
 #include "../include/network/stream_server.h"
 
-// Флаг для корректного выхода по Ctrl+C без зависания V4L2
 std::atomic<bool> g_running{true};
+std::shared_ptr<PCA9685> g_pca = nullptr;
+std::unique_ptr<Servo> g_gate = nullptr;
 
 void sigHandler(int) {
-    std::cout << "\n[SYSTEM] Получен сигнал остановки. Завершение работы...\n";
+    std::cout << "\n[SYSTEM] Получен сигнал остановки. Экстренное закрытие шторки...\n";
     g_running = false;
+    if (g_gate) {
+        g_gate->close();
+    }
 }
 
 int main() {
@@ -32,27 +37,28 @@ int main() {
     try {
         std::cout << "[SYSTEM] Запуск аппаратного рубежа ВСМ...\n";
 
-        // 1. АППАРАТНАЯ ЧАСТЬ (I2C / PCA9685 / Сервошторка)
-        auto bus = std::make_shared<I2CBus>("/dev/i2c-7");
-        auto pca = std::make_shared<PCA9685>(bus, 0x61);
-        pca->init(50.0f);
+        auto bus7 = std::make_shared<I2CBus>("/dev/i2c-7");
+        g_pca = std::make_shared<PCA9685>(bus7, 0x61);
+        g_pca->init(50.0f);
 
-        Servo gate(pca, 15);
-        std::cout << "[HARDWARE] Открываем защитную шторку нижнего короба...\n";
-        if (!gate.open()) {
-            std::cerr << "[HARDWARE] Ошибка открытия сервопривода!\n";
-            return 1;
+        g_gate = std::make_unique<Servo>(g_pca, 15);
+        g_gate->close(); // Исходное состояние: закрыто от пыли и щебня
+
+        std::cout << "[HARDWARE] Подключение ToF-дальномера VL53L0X на /dev/i2c-6...\n";
+        auto bus6 = std::make_shared<I2CBus>("/dev/i2c-6");
+        VL53L0X tofSensor(bus6, 0x29); // Дефолтный адрес VL53L0X
+        bool tofReady = tofSensor.init();
+        if (!tofReady) {
+            std::cerr << "[HARDWARE] Внимание: VL53L0X на /dev/i2c-6 не найден! Работаем в форсированном режиме.\n";
+            g_gate->open();
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(800));
 
-        // 2. СЕТЕВОЙ СЕРВЕР ТЕРМИНАЛА ОПЕРАТОРА
         StreamServer streamServer(8088);
         if (!streamServer.start()) {
             std::cerr << "[NETWORK] Не удалось запустить StreamServer на порту 8088!\n";
             return 1;
         }
 
-        // 3. ИНИЦИАЛИЗАЦИЯ НЕЙРОСЕТЕЙ НА NPU (Ascend 310B)
         std::cout << "[NPU] Загрузка модели yolov8n.om (Верхний контур)...\n";
         NpuModel yoloModel(0);
         if (!yoloModel.load("/tmp/hsm-barrier/models/yolov8n.om")) {
@@ -67,8 +73,8 @@ int main() {
             return 1;
         }
 
-        // 4. ОПТИЧЕСКИЕ ПОТОКИ (Камера 0 - Верх, Камера 4 - Низ)
-        std::cout << "[CAMERA] Подключение к /dev/video0 (Столб)...\n";
+
+        std::cout << "[CAMERA] Подключение к /dev/video0 (Столб / Крыша)...\n";
         CameraStream topCam(0, 640, 640);
         if (!topCam.open()) {
             std::cerr << "[CAMERA] Ошибка: не удалось открыть /dev/video0!\n";
@@ -76,10 +82,10 @@ int main() {
         }
         topCam.start();
 
-        std::cout << "[CAMERA] Подключение к /dev/video4 (Короб)...\n";
-        CameraStream bottomCam(4, 640, 480);
+        std::cout << "[CAMERA] Подключение к /dev/video2 (Нижний короб)...\n";
+        CameraStream bottomCam(2, 640, 480);
         if (!bottomCam.open()) {
-            std::cerr << "[CAMERA] Предупреждение: /dev/video4 недоступна, нижний контур оффлайн!\n";
+            std::cerr << "[CAMERA] Предупреждение: /dev/video2 недоступна!\n";
         } else {
             bottomCam.start();
         }
@@ -94,20 +100,45 @@ int main() {
         auto lastTopAlert = std::chrono::steady_clock::now();
         auto lastBottomAlert = std::chrono::steady_clock::now();
 
-        // Порог детекции аномалии
         constexpr float ANOMALY_THRESHOLD = 0.80f;
 
-        // ---------------------------------------------------------------------
-        // ПАРАМЕТРЫ ЗАЩИТЫ ОТ ДРЕБЕЗГА (DEBOUNCE FILTER)
-        // ---------------------------------------------------------------------
+        // Фильтры дребезга
         int topPersonStreak = 0;
-        constexpr int TOP_STREAK_TRIGGER = 2; // Сколько кадров подряд должен быть виден человек
+        constexpr int TOP_STREAK_TRIGGER = 2;
 
         int bottomAnomalyStreak = 0;
-        constexpr int BOTTOM_STREAK_TRIGGER = 2; // Сколько кадров подряд должен быть скачок аномалии
+        constexpr int BOTTOM_STREAK_TRIGGER = 2;
+
+        bool isTrainPresent = false;
+        auto lastTrainSeen = std::chrono::steady_clock::now();
 
         while (g_running) {
-            // --- КОНТУР 1: ВЕРХ (КРЫША / ЛЮДИ) ---
+            if (tofReady) {
+                int dist = tofSensor.readDistanceMm();
+                bool objectInZone = (dist > 0 && dist < 350);
+
+                if (objectInZone) {
+                    lastTrainSeen = std::chrono::steady_clock::now();
+                    if (!isTrainPresent) {
+                        std::cout << "🚂 [GATE] Состав вошел в створ (" << dist << " мм). Открываем сервошторку!\n";
+                        g_gate->open();
+                        isTrainPresent = true;
+                    }
+                } else {
+                    auto elapsedSinceTrain = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - lastTrainSeen).count();
+
+                    if (isTrainPresent && elapsedSinceTrain > 1500) {
+                        std::cout << "💤 [GATE] Состав прошел створ. Закрываем шторку короба.\n";
+                        g_gate->close();
+                        isTrainPresent = false;
+                        bottomAnomalyStreak = 0; // Сброс состояния детекций
+                    }
+                }
+            } else {
+                isTrainPresent = true; // Без дальномера держим контур всегда активным
+            }
+
             if (topCam.getLatestFrame(frameTop)) {
                 std::vector<float> inputTensor = fastPreprocessToNCHW(frameTop, 640, 640);
 
@@ -119,46 +150,43 @@ int main() {
                         if (det.classId == 0) personCount++;
                     }
 
-                    // Антидребезговый интегратор
+
                     if (personCount > 0) {
                         topPersonStreak = std::min(topPersonStreak + 1, 10);
                     } else {
-                        topPersonStreak = std::max(0, topPersonStreak - 1);
+                        topPersonStreak = 0; 
                     }
 
-                    // Срабатывание только при преодолении фильтра
-                    if (topPersonStreak >= TOP_STREAK_TRIGGER) {
-                        std::cout << "🚨 [ALERT ВЕРХ] Подтверждено присутствие человека! (" << personCount << " чел)\n";
-
+                    if (personCount > 0 && topPersonStreak >= TOP_STREAK_TRIGGER) {
                         auto now = std::chrono::steady_clock::now();
                         if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastTopAlert).count() > 400) {
                             lastTopAlert = now;
+                            std::cout << "🚨 [ALERT ВЕРХ] Подтверждено присутствие человека! (" << personCount << " чел)\n";
+                            // Передача сжатого кадра оператору по выделенному каналу 1
                             streamServer.broadcastAlarmFrame(1, frameTop);
                         }
                     }
                 }
             }
 
-            // --- КОНТУР 2: НИЗ (ДНИЩЕ / АНОМАЛИИ) ---
-            if (bottomCam.isRunning() && bottomCam.getLatestFrame(frameBottom)) {
+
+            if (isTrainPresent && bottomCam.isRunning() && bottomCam.getLatestFrame(frameBottom)) {
                 const AnomalyResult anomaly = patchcore.detect(frameBottom, ANOMALY_THRESHOLD);
 
-                // Антидребезговый интегратор
                 if (anomaly.isAnomaly) {
                     bottomAnomalyStreak = std::min(bottomAnomalyStreak + 1, 10);
                 } else {
-                    bottomAnomalyStreak = std::max(0, bottomAnomalyStreak - 1);
+                    bottomAnomalyStreak = 0; // Сбрасываем мгновенно, чтобы не забивать шину
                 }
 
-                // Срабатывание только при подтверждении на серии кадров
-                if (bottomAnomalyStreak >= BOTTOM_STREAK_TRIGGER) {
-                    std::cout << "🚨 [ALERT НИЗ] Подтверждена аномалия днища! Score: "
-                              << std::fixed << std::setprecision(3) << anomaly.anomalyScore
-                              << " (Streak: " << bottomAnomalyStreak << ")\n";
-
+                if (anomaly.isAnomaly && bottomAnomalyStreak >= BOTTOM_STREAK_TRIGGER) {
                     auto now = std::chrono::steady_clock::now();
                     if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastBottomAlert).count() > 400) {
                         lastBottomAlert = now;
+                        std::cout << "🚨 [ALERT НИЗ] Подтверждена аномалия днища! Score: "
+                                  << std::fixed << std::setprecision(3) << anomaly.anomalyScore
+                                  << " (Streak: " << bottomAnomalyStreak << ")\n";
+                        // Передача сжатого кадра оператору по выделенному каналу 2
                         streamServer.broadcastAlarmFrame(2, frameBottom);
                     }
                 }
@@ -167,15 +195,16 @@ int main() {
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
 
-        // Корректная остановка при выходе
+        // Корректная остановка
         std::cout << "[SYSTEM] Закрываем оптические модули...\n";
         topCam.stop();
         bottomCam.stop();
         streamServer.stop();
-        gate.close();
+        if (g_gate) g_gate->close();
 
     } catch (const std::exception& e) {
         std::cerr << "[FATAL] Системная ошибка: " << e.what() << '\n';
+        if (g_gate) g_gate->close();
         return 1;
     }
 
