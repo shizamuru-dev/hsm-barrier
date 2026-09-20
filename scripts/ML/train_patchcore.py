@@ -1,51 +1,61 @@
 import os
 from pathlib import Path
+import torch
 from anomalib.data import Folder
 from anomalib.models import Patchcore
 from anomalib.engine import Engine
-import albumentations as A
 
-DATASET_ROOT = Path("dataset")
+def main():
+    # Оптимизация матричных вычислений для архитектур Ampere
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision('high')
 
-# 1. Датасет с легкой аугментацией на свет (чтобы не орал на мелкие тени)
-datamodule = Folder(
-    name="undercarriage_hq",
-    root=DATASET_ROOT,
-    normal_dir="train/good",
-    abnormal_dir="test/bad",
-    normal_test_dir="test/good",
-    train_batch_size=4,
-    eval_batch_size=4,
-    num_workers=4,
-)
+    DATASET_ROOT = Path("dataset")
 
-# 2. Wide-ResNet50 для честной пространственной семантики
-print("[INFO] Конфигурация модели PatchCore (Wide-ResNet50-2)...")
-model = Patchcore(
-    backbone="wide_resnet50_2",
-    layers=["layer2", "layer3"],
-    pre_trained=True,
-    coreset_sampling_ratio=0.2, # Плотное ядро нормы
-    num_neighbors=9             # Чуть сглаживаем локальные выбросы (вместо 5)
-)
+    # 1. Конфигурация датамодуля (num_workers=0 исключает сбой процессов на Windows)
+    datamodule = Folder(
+        name="undercarriage_hq",
+        root=DATASET_ROOT,
+        normal_dir="train/good",
+        abnormal_dir="test/bad",
+        normal_test_dir="test/good",
+        train_batch_size=4,
+        eval_batch_size=4,
+        num_workers=0,  # Обязательно 0 для стабильной работы под Windows
+    )
 
-engine = Engine(
-    max_epochs=1,
-    accelerator="auto",
-    default_root_dir="results_hq",
-)
+    # 2. Модель PatchCore (Wide-ResNet50-2)
+    print("[INFO] Конфигурация модели PatchCore (Wide-ResNet50-2)...")
+    model = Patchcore(
+        backbone="wide_resnet50_2",
+        layers=["layer2", "layer3"],
+        pre_trained=True,
+        coreset_sampling_ratio=0.2,  # Плотное ядро нормы
+        num_neighbors=9              # Сглаживание локальных выбросов
+    )
 
-print("🚀 Обучение Coreset-памяти...")
-engine.fit(model=model, datamodule=datamodule)
+    # 3. Движок обучения Lightning/Anomalib
+    engine = Engine(
+        max_epochs=1,
+        accelerator="auto",
+        default_root_dir="results_hq",
+    )
 
-# 3. Экспорт под фиксированный вход 256x256 (или 384x384, если дефекты мелкие)
-output_dir = Path("models_exported")
-print(f"📦 Экспорт в ONNX...")
-engine.export(
-    model=model,
-    export_type="onnx",
-    export_root=output_dir,
-    input_size=(256, 256),
-)
+    # 4. Построение базы векторов эталона
+    print("🚀 Обучение Coreset-памяти...")
+    engine.fit(model=model, datamodule=datamodule)
 
-print("✅ Качественный ONNX готов!")
+    # 5. Экспорт в ONNX со статическим входом для компилятора ATC
+    output_dir = Path("models_exported")
+    print("📦 Экспорт в ONNX...")
+    engine.export(
+        model=model,
+        export_type="onnx",
+        export_root=output_dir,
+        input_size=(256, 256),
+    )
+
+    print("✅ Качественный ONNX готов!")
+
+if __name__ == "__main__":
+    main()
