@@ -33,6 +33,8 @@ add_executable(barrier
         include/hardware/servo.h
         src/hardware/vl53l0x.cpp
         include/hardware/vl53l0x.h
+        src/hardware/l298n.cpp
+        include/hardware/l298n.h
 
         # NPU
         src/npu/npu_model.cpp
@@ -47,7 +49,6 @@ add_executable(barrier
         include/npu/patchcore_engine.h
         include/npu/patchcore_engine.h
 
-        # Network
 
 )
 
