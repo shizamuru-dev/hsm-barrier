@@ -11,6 +11,7 @@
 #include "../include/hardware/i2c_bus.h"
 #include "../include/hardware/pca9685.h"
 #include "../include/hardware/servo.h"
+#include "../include/hardware/l298n.h"
 #include "../include/hardware/camera_stream.h"
 #include "../include/npu/npu_model.h"
 #include "../include/npu/yolo_postprocess.h"
@@ -21,10 +22,14 @@
 std::atomic<bool> g_running{true};
 std::shared_ptr<PCA9685> g_pca = nullptr;
 std::unique_ptr<Servo> g_gate = nullptr;
+std::unique_ptr<L298N> g_leds = nullptr;
 
 void sigHandler(int) {
     std::cout << "\n[SYSTEM] Получен сигнал остановки (SIGINT/SIGTERM). Закрытие шторки...\n";
     g_running = false;
+    if (g_leds) {
+        g_leds->allOff();
+    }
     if (g_gate) {
         g_gate->close();
     }
@@ -38,7 +43,7 @@ int main() {
         std::cout << "[SYSTEM] Запуск аппаратного рубежа ВСМ (РЕЖИМ ЭМУЛЯЦИИ ДАТЧИКА)...\n";
 
         // =====================================================================
-        // 1. АППАРАТНАЯ ЧАСТЬ (I2C-7 для PCA9685 / Сервошторки)
+        // 1. АППАРАТНАЯ ЧАСТЬ (I2C-7 для PCA9685 / Сервошторки + GPIO для LED)
         // =====================================================================
         auto bus7 = std::make_shared<I2CBus>("/dev/i2c-7");
         g_pca = std::make_shared<PCA9685>(bus7, 0x61);
@@ -47,6 +52,21 @@ int main() {
         g_gate = std::make_unique<Servo>(g_pca, 15);
         g_gate->close(); // Исходное состояние: закрыто (ждём состав)
         std::cout << "[HARDWARE] Защитная шторка установлена в положение CLOSE (0°).\n";
+
+        // Инициализация драйвера светодиодов L298N
+        constexpr uint8_t LED_IN1 = 0, LED_IN2 = 1, LED_IN3 = 2, LED_IN4 = 3;
+        constexpr uint8_t LED_ENA = 4, LED_ENB = 5;
+
+        g_leds = std::make_unique<L298N>(g_pca, LED_IN1, LED_IN2, LED_IN3, LED_IN4,
+                                         LED_ENA, LED_ENB);
+        if (!g_leds->init()) {
+            std::cerr << "[HARDWARE] Предупреждение: не удалось инициализировать светодиоды!\n";
+            g_leds = nullptr;
+        } else {
+            g_leds->allOff(); // Светодиоды выключены при старте
+            std::cout << "[HARDWARE] Светодиоды инициализированы через PCA9685 (каналы "
+                      << LED_IN1 << ", " << LED_IN2 << ", " << LED_IN3 << ", " << LED_IN4 << ").\n";
+        }
 
         // =====================================================================
         // 2. СЕТЕВОЙ СЕРВЕР ТЕРМИНАЛА ОПЕРАТОРА
@@ -62,14 +82,14 @@ int main() {
         // =====================================================================
         std::cout << "[NPU] Загрузка модели yolov8n.om (Верхний контур)...\n";
         NpuModel yoloModel(0);
-        if (!yoloModel.load("/tmp/hsm-barrier/models/yolov8n.om")) {
+        if (!yoloModel.load("/root/tmp/hsm-barrier/models/yolov8n.om")) {
             std::cerr << "[NPU] Ошибка загрузки models/yolov8n.om!\n";
             return 1;
         }
 
         std::cout << "[NPU] Загрузка модели patchcore.om (Нижний контур)...\n";
         PatchcoreEngine patchcore(0);
-        if (!patchcore.load("/tmp/hsm-barrier/models/patchcore.om")) {
+        if (!patchcore.load("/root/tmp/hsm-barrier/models/patchcore.om")) {
             std::cerr << "[NPU] Ошибка загрузки models/patchcore.om!\n";
             return 1;
         }
@@ -78,7 +98,7 @@ int main() {
         // 4. ОПТИЧЕСКИЕ ПОТОКИ (Камера 0 - Верх, Камера 2 - Низ)
         // =====================================================================
         std::cout << "[CAMERA] Подключение к /dev/video0 (Столб / Крыша)...\n";
-        CameraStream topCam(0, 640, 640);
+        CameraStream topCam(2, 640, 640);
         if (!topCam.open()) {
             std::cerr << "[CAMERA] Ошибка: не удалось открыть /dev/video0!\n";
             return 1;
@@ -86,14 +106,14 @@ int main() {
         topCam.start();
 
         std::cout << "[CAMERA] Подключение к /dev/video2 (Нижний короб)...\n";
-        CameraStream bottomCam(2, 640, 480);
+        CameraStream bottomCam(0, 640, 480);
         if (!bottomCam.open()) {
             std::cerr << "[CAMERA] Предупреждение: /dev/video2 недоступна!\n";
         } else {
             bottomCam.start();
         }
 
-        std::cout << "[PIPELINE] Комплекс активен. Запущен таймер ожидания (5 сек до входа состава)...\n";
+        std::cout << "[PIPELINE] Комплекс активен.\n";
 
         cv::Mat frameTop;
         cv::Mat frameBottom;
@@ -125,6 +145,15 @@ int main() {
                 if (elapsedSec >= 5) {
                     std::cout << "🚂 [GATE] Открываем сервошторку короба днища...\n";
                     g_gate->open();
+                    if (g_leds) {
+                        g_leds->enableA(true);
+                        g_leds->enableB(true);
+                        g_leds->setIN1(true);
+                        g_leds->setIN2(true);
+                        g_leds->setIN3(true);
+                        g_leds->setIN4(true);
+                        std::cout << "💡 [LED] Светодиоды включены.\n";
+                    }
                     isTrainPresent = true;
                 }
             }
@@ -186,6 +215,10 @@ int main() {
 
         // Корректная остановка при выходе по Ctrl+C
         std::cout << "\n[SYSTEM] Завершение работы. Закрываем шторку и модули...\n";
+        if (g_leds) {
+            g_leds->allOff();
+            std::cout << "[LED] Светодиоды выключены.\n";
+        }
         if (g_gate) g_gate->close();
         topCam.stop();
         bottomCam.stop();
@@ -193,6 +226,7 @@ int main() {
 
     } catch (const std::exception& e) {
         std::cerr << "[FATAL] Системная ошибка: " << e.what() << '\n';
+        if (g_leds) g_leds->allOff();
         if (g_gate) g_gate->close();
         return 1;
     }
