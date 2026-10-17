@@ -4,11 +4,12 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <string>
 
 
 class CameraStream {
 public:
-    explicit CameraStream(int deviceIndex, int width = 640, int height = 480);
+    explicit CameraStream(std::string devicePath, int width = 640, int height = 480);
     ~CameraStream();
 
     CameraStream(const CameraStream&) = delete;
@@ -21,12 +22,16 @@ public:
     // Забирает последний актуальный кадр
     bool getLatestFrame(cv::Mat& outFrame);
 
+    static std::string findDevicePath(const std::string& preferred = "",
+                                      const std::string& excluded = "");
+    [[nodiscard]] const std::string& devicePath() const { return m_devicePath; }
+
     [[nodiscard]] bool isRunning() const { return m_running; }
 
 private:
     void captureLoop();
 
-    int m_deviceIndex;
+    std::string m_devicePath;
     int m_width;
     int m_height;
 

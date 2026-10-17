@@ -6,26 +6,29 @@
 
 #include <iostream>
 #include <chrono>
+#include <algorithm>
+#include <filesystem>
+#include <vector>
+#include "../../include/logging.h"
 
-CameraStream::CameraStream(const int deviceIndex, const int width, const int height)
-    : m_deviceIndex(deviceIndex), m_width(width), m_height(height) {}
+CameraStream::CameraStream(std::string devicePath, const int width, const int height)
+    : m_devicePath(std::move(devicePath)), m_width(width), m_height(height) {}
 
 CameraStream::~CameraStream() {
     stop();
 }
 
 bool CameraStream::open() {
-    // Открываем через V4L2 бэкенд
-    m_cap.open(m_deviceIndex, cv::CAP_V4L2);
+    m_cap.open(m_devicePath, cv::CAP_V4L2);
     if (!m_cap.isOpened()) {
-        std::cerr << "[Camera " << m_deviceIndex << "] Ошибка открытия устройства\n";
+        LOG_ERROR("camera", "Не удалось открыть ", m_devicePath);
         return false;
     }
 
     // Включаем MJPEG для быстрого потока
     m_cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
-    m_cap.set(cv::CAP_PROP_FRAME_WIDTH, 1280);
-    m_cap.set(cv::CAP_PROP_FRAME_HEIGHT, 720);
+    m_cap.set(cv::CAP_PROP_FRAME_WIDTH, m_width);
+    m_cap.set(cv::CAP_PROP_FRAME_HEIGHT, m_height);
     m_cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
     m_cap.set(cv::CAP_PROP_AUTOFOCUS, 0); // Отключаем плавающий автофокус
 
@@ -33,6 +36,35 @@ bool CameraStream::open() {
     m_cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
 
     return true;
+}
+
+std::string CameraStream::findDevicePath(const std::string& preferred,
+                                         const std::string& excluded) {
+    std::vector<std::string> paths;
+    if (!preferred.empty()) paths.push_back(preferred);
+    try {
+        for (const auto& entry : std::filesystem::directory_iterator("/dev")) {
+            const auto path = entry.path().string();
+            if (path.starts_with("/dev/video") && path != preferred && path != excluded)
+                paths.push_back(path);
+        }
+    } catch (const std::filesystem::filesystem_error& error) {
+        LOG_WARN("camera", "Не удалось перечислить /dev: ", error.what());
+    }
+    if (!preferred.empty() && paths.size() > 1) {
+        std::sort(paths.begin() + 1, paths.end());
+    } else {
+        std::sort(paths.begin(), paths.end());
+    }
+    for (const auto& path : paths) {
+        cv::VideoCapture probe(path, cv::CAP_V4L2);
+        if (probe.isOpened()) {
+            probe.release();
+            LOG_INFO("camera", "Выбрано устройство ", path);
+            return path;
+        }
+    }
+    return {};
 }
 
 void CameraStream::start() {

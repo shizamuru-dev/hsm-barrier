@@ -7,6 +7,7 @@
 #include <csignal>
 #include <atomic>
 #include <algorithm>
+#include <filesystem>
 
 #include "../include/hardware/i2c_bus.h"
 #include "../include/hardware/pca9685.h"
@@ -17,6 +18,7 @@
 #include "../include/npu/yolo_postprocess.h"
 #include "../include/npu/patchcore_engine.h"
 #include "../include/network/stream_server.h"
+#include "../include/logging.h"
 
 // Глобальные флаги и дескрипторы для безопасного завершения
 std::atomic<bool> g_running{true};
@@ -40,7 +42,7 @@ int main() {
     std::signal(SIGTERM, sigHandler);
 
     try {
-        std::cout << "[SYSTEM] Запуск аппаратного рубежа ВСМ (РЕЖИМ ЭМУЛЯЦИИ ДАТЧИКА)...\n";
+        LOG_INFO("system", "Запуск аппаратного рубежа ВСМ");
 
         // =====================================================================
         // 1. АППАРАТНАЯ ЧАСТЬ (I2C-7 для PCA9685 / Сервошторки + GPIO для LED)
@@ -54,8 +56,8 @@ int main() {
         std::cout << "[HARDWARE] Защитная шторка установлена в положение CLOSE (0°).\n";
 
         // Инициализация драйвера светодиодов L298N
-        constexpr uint8_t LED_IN1 = 0, LED_IN2 = 1, LED_IN3 = 2, LED_IN4 = 3;
-        constexpr uint8_t LED_ENA = 4, LED_ENB = 5;
+        constexpr uint8_t LED_IN1 = 8, LED_IN2 = 9, LED_IN3 = 10, LED_IN4 = 11;
+        constexpr uint8_t LED_ENA = 0, LED_ENB = 1;
 
         g_leds = std::make_unique<L298N>(g_pca, LED_IN1, LED_IN2, LED_IN3, LED_IN4,
                                          LED_ENA, LED_ENB);
@@ -95,20 +97,28 @@ int main() {
         }
 
         // =====================================================================
-        // 4. ОПТИЧЕСКИЕ ПОТОКИ (Камера 0 - Верх, Камера 2 - Низ)
+        // 4. ОПТИЧЕСКИЕ ПОТОКИ. Имена создаются udev и не зависят от videoN.
         // =====================================================================
-        std::cout << "[CAMERA] Подключение к /dev/video0 (Столб / Крыша)...\n";
-        CameraStream topCam(2, 640, 640);
+        const std::string topPath = "/dev/camera-top";
+        const std::string bottomPath = "/dev/camera-bottom";
+        if (!std::filesystem::exists(topPath)) {
+            LOG_ERROR("camera", "Не найден udev-путь верхней камеры: ", topPath,
+                      ". Проверьте правила /etc/udev/rules.d/99-hsm-cameras.rules");
+            return 1;
+        }
+        CameraStream topCam(topPath, 640, 640);
         if (!topCam.open()) {
-            std::cerr << "[CAMERA] Ошибка: не удалось открыть /dev/video0!\n";
+            LOG_ERROR("camera", "Не удалось открыть верхнюю камеру ", topPath);
             return 1;
         }
         topCam.start();
 
-        std::cout << "[CAMERA] Подключение к /dev/video2 (Нижний короб)...\n";
-        CameraStream bottomCam(0, 640, 480);
-        if (!bottomCam.open()) {
-            std::cerr << "[CAMERA] Предупреждение: /dev/video2 недоступна!\n";
+        CameraStream bottomCam(bottomPath, 640, 480);
+        if (!std::filesystem::exists(bottomPath)) {
+            LOG_WARN("camera", "Не найден udev-путь нижней камеры: ", bottomPath,
+                     ". Контур аномалий отключён");
+        } else if (!bottomCam.open()) {
+            LOG_WARN("camera", "Нижняя камера недоступна");
         } else {
             bottomCam.start();
         }
@@ -146,12 +156,10 @@ int main() {
                     std::cout << "🚂 [GATE] Открываем сервошторку короба днища...\n";
                     g_gate->open();
                     if (g_leds) {
-                        g_leds->enableA(true);
-                        g_leds->enableB(true);
-                        g_leds->setIN1(true);
+                        g_leds->setIN1(false);
                         g_leds->setIN2(true);
                         g_leds->setIN3(true);
-                        g_leds->setIN4(true);
+                        g_leds->setIN4(false);
                         std::cout << "💡 [LED] Светодиоды включены.\n";
                     }
                     isTrainPresent = true;

@@ -23,6 +23,7 @@ endif()
 
 add_executable(barrier
         src/main.cpp
+        src/logging.cpp
 
         # Hardware
         src/hardware/i2c_bus.cpp
